@@ -1,0 +1,164 @@
+version 1.0;
+
+/* Namespace declarations */
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+
+/* Imports */
+import "../import/junos.xsl";
+
+/* Event script arguments */
+param $ftp-url;   /* Absolute path of image with FTP syntax */
+param $options;   /* Installation options */
+param $trap;      /* Argument trap */
+param $value5;    /* Argument value5 */
+param $argument5; /* Argument argument5 */
+
+/* Global variables */
+var $con = jcs:open();       /* Opens a global connection */
+var $other-re-uptime = 180;  /* Uptime in seconds */
+
+match / {
+    <event-script-results> {
+
+        /* Determine if the local RE is RE0 or RE1 */
+        var $local-re = { call determine-local-re(); }
+
+        /* Based on the local RE determine the other REBased on the local RE determine the other RE */
+        var $other-re = {
+            if ($local-re == "re0") {
+                expr "re1";
+            }
+            else {
+                expr "re0";
+            }
+        }
+
+        /* Getting other RE details */
+        var $rpc = <command> "show version invoke-on other-routing-engine";
+        var $result = jcs:execute($con, $rpc);
+        var $version-other-re = { call get-sw-version($result); }
+
+        /* Getting Current RE details */
+        var $kern-osrelease = jcs:sysctl("kern.osrelease", "s");
+        var $version-set = jcs:split("[IRSBX-]", $kern-osrelease );
+        var $version-current = $version-set[1];
+
+        /* Getting System uptime information of other RE */
+        var $uptime-Otherre = <command> "show system uptime invoke-on other-routing-engine";
+        var $uptime-Info = jcs:execute($con, $uptime-Otherre);
+        var $uptime-Seconds = $uptime-Info//system-uptime-information/uptime-information/up-time/@junos:seconds;
+
+        /* 
+         * Reboot other(backup) RE:
+         * if Other RE version less than current RE version
+         * and Other RE uptime less than 3 Mins (180 secs)
+         * and if atribute match success. 
+         */
+
+        var $boolean = { call attr-check-matches(); }
+
+        if ($version-other-re < $version-current && $uptime-Seconds < $other-re-uptime && $boolean == "true") {
+
+            /* Copying file to other RE "/var/tmp" location */
+            var $rpc2 = {
+                <file-copy> {
+                    <source> $ftp-url;
+                    <destination> "/var/tmp/";
+                }
+            } 
+            expr jcs:output("File copy operation in-progress !!"); 
+            var $result2 = jcs:execute($con, $rpc2);
+                
+            if ($result2//xnm:error) {
+                /* Failure case */
+                expr jcs:output("File copy operation failed !!");
+            }  else {
+                /* Success case */
+                expr jcs:output("File copy operation success !!"); 
+
+                var $file = { call substring-after-last($string = $ftp-url, $delimiter = '/'); }
+                var $other-re-upgrade-string =  "request system software add " _ $file _ " " _ $other-re _ " " _ $options;
+                var $other-re-command = <command> $other-re-upgrade-string;
+
+                var $other-re-progress-string = "Executing command: '" _
+                $other-re-upgrade-string _ "' - this might take a few minutes...\n";
+
+                expr jcs:output($other-re-progress-string);
+
+                var $other-result = jcs:execute($con, $other-re-command ); 
+                   
+                /* Dump the output to user terminal */ 
+                for-each( $other-result//text() ) {
+                     expr jcs:output( . ); 
+                }
+                
+                /* Closing the connection */
+                expr jcs:close($con);
+            }
+        }  
+    }
+}
+
+/*
+ * This template determines which RE is the local RE based on the results of
+ * the show chassis routing-engine command. It returns either "re0" or "re1" for
+ * variable assignment.
+ */
+template determine-local-re()
+{
+    /* Retrieve "show chassis routing-engine */
+    var $get-routing-engine = <get-route-engine-information>;
+    var $routing-engine-info = jcs:execute( $con, $get-routing-engine );
+
+    /* Now perform checks on the routing-engine information looking for a match */
+
+    /* Does it have slot information? If not then it's a single slot machine so return re0 */
+    if( not( $routing-engine-info/route-engine/slot ) ) {
+        expr "re0";
+    }
+    /* Does re0 have the load-average-one tag? That indicates the current RE. */
+    else if( $routing-engine-info/route-engine[slot == "0"]/load-average-one ) {
+        expr "re0";
+    }
+    /* Does re1 have the load-average-one tag? That indicates the current RE. */
+    else if( $routing-engine-info/route-engine[slot == "1"]/load-average-one ) {
+        expr "re1";
+    }
+    /* Default to re0 */
+    else {
+        expr "re0";
+    }
+}
+
+/* Getting version details */
+template get-sw-version($result)
+{
+    var $data = $result//package-information[name == "junos"]/comment;
+    var $s1 = substring-after($data, "[");
+    var $s2 = substring-before($s1, "]");
+    var $version-set = jcs:split("[IRSBX-]", $s2 );
+    expr $version-set[1];
+}
+
+/* Getting image name from recursive template */ 
+template substring-after-last($string, $delimiter)
+{
+      if (contains($string, $delimiter)) {
+          call substring-after-last($string = substring-after($string, $delimiter), $delimiter = $delimiter);
+      } else {
+          expr "/var/tmp/" _ $string;
+      }
+}
+
+/* Checking attribute match w.r.t event triggerred */ 
+template attr-check-matches( )
+{
+   if (contains($trap, "Fru Online") && contains($value5, "Routing Engine")
+       && contains($argument5, "jnxFruName")) {
+       expr true();
+   } else {
+       expr false();
+   }
+}
